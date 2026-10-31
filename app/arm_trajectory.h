@@ -19,6 +19,7 @@ class ArmTrajectory {
 
  private:
   CartesianReference start_{}, end_{};
+  CartesianReference last_{};
   float duration_s_{};
   bool running_{false};
 };

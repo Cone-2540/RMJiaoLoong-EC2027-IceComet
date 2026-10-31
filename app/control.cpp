@@ -135,13 +135,71 @@ void robotReset(void) {
 
 // 开机上电启动处理
 bool robotStartup(void) {
-  bool flag = true;
-
-  return flag;
+  if (!arm.calibrated()) {
+    return false;
+  }
+  return true;
 }
 
 // 机器人控制
 void robotControl(void) {
+  const bool left_changed = rc.switch_.l!=last_rc_switch.l;
+  if (left_changed) {
+    arm.trajAbort();
+    arm_step =0;
+    arm_start_ok = false;
+  }
+
+  //左侧拨杆上，自动轨迹模式
+  if (rc.switch_.l == decltype(rc)::UP) {
+    const float target[4][2]={
+      {0.100f, -0.100f},   // B
+      {-0.100f, -0.100f},  // C
+      {-0.100f, 0.100f},   // D
+      {0.100f, 0.100f},
+    };
+    const float duration_s =1.0f;
+    if (arm_step == 5) {
+      return;
+    }
+    if (arm_step!=0) {
+      if (arm.trajRunning()) {
+        return;
+      }
+    }
+    if (!arm.trajFinished() || arm_step ==4) {
+      arm_step = 5;
+      return;
+    }
+
+    arm_start_ok = arm.trajStart(target[arm_step][0],target[arm_step][1],duration_s);
+    if (arm_start_ok) {
+      arm_step++;
+    }else {
+      arm_step =5;
+    }
+  }
+  //左侧拨杆下，标定零点
+  if (rc.switch_.l == decltype(rc)::DOWN) {
+    arm.trajAbort();
+    arm.calibrate(0.0f,0.0f);
+  }
+
+  //左侧拨杆中，手动控制j0、j1
+  if (rc.switch_.l == decltype(rc)::MID) {
+    if (arm.enable()) {
+      const int16_t channel[2] = {rc.channel_.l_col, rc.channel_.r_col};
+      float speed[2] = {};
+      for (int i = 0; i < 2; ++i) {
+        if (channel[i] > 20) {
+          speed[i] = (channel[i] - 20) / 640.f * math::deg2rad(1440.f);
+        } else if (channel[i] < -20) {
+          speed[i] = (channel[i] + 20) / 640.f * math::deg2rad(1440.f);
+        }
+      }
+      arm.addJointReference(speed[0], speed[1], 0.001f);
+    }
+  }
 }
 
 // 板载LED指示灯效果

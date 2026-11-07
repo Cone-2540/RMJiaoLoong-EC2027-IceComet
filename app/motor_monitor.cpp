@@ -10,6 +10,9 @@
  */
 
 #include "app/motor_monitor.h"
+#include "app/manual_config.h"
+#include "app/arm.h"
+#include "base/common/math.h"
 #include "lib/arm_math/arm_math.h"
 
 // Motor parameter config
@@ -52,20 +55,36 @@
 // Other motors
 // 在线 KF Q 为 deg²、(deg/s)²，R 为 deg²
 const Motor::KFParam_t joint_kf_param(5.f, 6e5f, 1.f);
-const PID J0_spid(30,0.01,0,0,16384,1);
+const PID J0_spid(30,0.01,0,0,manual::current_limit * manual::current_to_raw,1);
 const PID J0_ppid(75,0,400,0,1440,1);
-// J0 齿轮传动反向，用负传动比统一关节正方向；同时换算反馈和输出
-Motor J0(Motor::M3508, -1, Motor::POSITION_SPEED,  // type, ratio, method
+// 同步轮实测 40.43 / 64.68 mm，暂沿用原方向符号。
+Motor J0(Motor::M3508, manual::j0_ratio, Motor::POSITION_SPEED,
          J0_ppid,           // ppid
          J0_spid,           // spid
          true, joint_kf_param);  // 启用在线 KF
 
-const PID J1_spid(12,0,50,0,16384,1);
+const PID J1_spid(12,0,50,0,manual::current_limit * manual::current_to_raw,1);
 const PID J1_ppid( 50,0,100,0,1440,1);
-Motor J1(Motor::M3508, 1, Motor::POSITION_SPEED,
+Motor J1(Motor::M3508, manual::j1_ratio, Motor::POSITION_SPEED,
          J1_ppid,
          J1_spid,
          true, joint_kf_param);
+
+MotorDebugData j0_debug{}, j1_debug{};
+extern Arm arm;
+
+static void updateDebug(Motor& motor, MotorDebugData& debug) {
+  debug.target_deg = motor.targetAngle();
+  debug.angle_deg = motor.realAngle();
+  debug.error_deg = debug.target_deg - debug.angle_deg;
+  debug.target_dps = motor.targetSpeed();
+  debug.speed_dps = motor.realSpeed();
+  debug.raw_speed_dps = motor.motor_data_.rotate_speed;
+  // 转成关节正方向的指令，便于与反馈速度对比。
+  debug.command_a = motor.intensity_ * math::sign(motor.ratio_) / manual::current_to_raw;
+  debug.feedback_current_raw = motor.motor_data_.current;
+  debug.temperature = motor.motor_data_.temp;
+}
 
 // DJI Motor id config, M3508/M2006: 1~8, GM6020: 5~11
 // DJI电机ID配置，M3508，M2006可配置范围为1~8，GM6020可配置范围为5~11
@@ -204,6 +223,8 @@ void allMotorsInit(void) {
   // KF 输出仍使用 deg、deg/s；位置环和速度环都使用滤波反馈
   J0.setFdbSrc(&J0.kfAngle(), &J0.kfSpeed());
   J1.setFdbSrc(&J1.kfAngle(), &J1.kfSpeed());
+  J0.info_.max_intensity = J1.info_.max_intensity =
+      manual::current_limit * manual::current_to_raw;
 }
 
 // Handle all motors. Called in motorTask
@@ -221,6 +242,10 @@ void allMotorsHandle(void) {
     // call motor::handle() through MITMotorDriver::handle()
     i.handle();
   }
+  updateDebug(J0, j0_debug);
+  updateDebug(J1, j1_debug);
+  manual_mode = static_cast<uint32_t>(arm.mode());
+  calibration_ok = arm.calibrated() ? 1u : 0u;
 }
 
 // Check CAN channel and id of received CAN message

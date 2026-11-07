@@ -41,4 +41,13 @@ extern Motor J0, J1;
 extern Motor* can1_dji_motor[11];
 extern Motor* can2_dji_motor[11];
 
+// Scope 观测值：角度 deg，速度 deg/s，电流指令 A，反馈电流保留原始值。
+struct MotorDebugData {
+  float target_deg, angle_deg, error_deg;
+  float target_dps, speed_dps, raw_speed_dps;
+  float command_a, feedback_current_raw, temperature;
+};
+extern MotorDebugData j0_debug, j1_debug;
+extern uint32_t manual_mode, calibration_ok, rc_connected;
+
 #endif  // MOTOR_MONITOR_H

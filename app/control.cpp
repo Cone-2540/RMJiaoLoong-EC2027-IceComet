@@ -10,6 +10,7 @@
 
 #include "app/control.h"
 #include "app/arm.h"
+#include "app/manual_config.h"
 
 #include "iwdg.h"
 
@@ -56,6 +57,9 @@ RC::RCSwitch last_rc_switch;
 
 uint8_t arm_step = 0;  // 0 空闲，1 预备，2~5 依次走向 B、C、D、A
 volatile bool arm_start_ok = false;  // 最近一次轨迹是否启动成功
+uint32_t manual_mode = 0;  // 0 失能，1 位置，2 速度，3 电流
+uint32_t calibration_ok = 0;
+uint32_t rc_connected = 0;
 
 // 控制初始化
 void controlInit(void) {
@@ -81,6 +85,7 @@ void controlInit(void) {
 
 // 控制主循环
 void controlLoop(void) {
+  rc_connected = rc.connect_.check() ? 1u : 0u;
   iwdgHandler(rc.connect_.check());
   robotPowerStateFSM(!rc.connect_.check() || rc.switch_.r == decltype(rc)::DOWN);
 
@@ -142,6 +147,57 @@ bool robotStartup(void) {
 
 // 机器人控制
 void robotControl(void) {
+  const bool changed = rc.switch_.l != last_rc_switch.l ||
+                       rc.switch_.r != last_rc_switch.r;
+  const bool centered = fabsf(static_cast<float>(rc.channel_.l_col)) <= manual::stick_deadband &&
+                        fabsf(static_cast<float>(rc.channel_.r_col)) <= manual::stick_deadband;
+  // 两根竖向摇杆，死区外线性映射到 [-1, 1]。
+  const auto stick = [](float value) {
+    if (fabsf(value) <= manual::stick_deadband) return 0.f;
+    return math::limit((value - math::sign(value) * manual::stick_deadband) /
+                       (manual::stick_range - manual::stick_deadband), -1.f, 1.f);
+  };
+  const float input0 = stick(rc.channel_.l_col);
+  const float input1 = stick(rc.channel_.r_col);
+  const bool calibrate = rc.switch_.l == decltype(rc)::MID &&
+                         rc.switch_.r == decltype(rc)::MID;
+  Arm::Mode requested = Arm::Mode::Disabled;
+  if (rc.switch_.r == decltype(rc)::UP) {
+    if (rc.switch_.l == decltype(rc)::UP) requested = Arm::Mode::Joint;
+    if (rc.switch_.l == decltype(rc)::DOWN) requested = Arm::Mode::Speed;
+  } else if (rc.switch_.r == decltype(rc)::MID &&
+             rc.switch_.l == decltype(rc)::DOWN) {
+    requested = Arm::Mode::Current;
+  }
+
+  if (calibrate) {
+    arm.disable();
+    if (changed) arm.calibrate(0.f, 0.f);
+  } else if (requested != Arm::Mode::Disabled) {
+    // 切换模式时摇杆需回中；上电、掉线恢复不会自行重新使能。
+    if (changed) {
+      arm.disable();
+      if (centered) arm.enable(requested);
+    }
+    if (arm.mode() == requested) {
+      if (requested == Arm::Mode::Joint) {
+        arm.addJointReference(math::deg2rad(input0 * manual::position_speed),
+                              math::deg2rad(input1 * manual::position_speed), manual::dt);
+      } else if (requested == Arm::Mode::Speed) {
+        arm.setJointSpeed(math::deg2rad(input0 * manual::speed_limit),
+                           math::deg2rad(input1 * manual::speed_limit));
+      } else {
+        arm.setJointCurrent(input0 * manual::current_command * manual::current_to_raw,
+                             input1 * manual::current_command * manual::current_to_raw);
+      }
+    }
+  } else {
+    // 其他挡位保持当前位置；从速度/电流模式退出时重新捕获位置。
+    if (arm.mode() == Arm::Mode::Speed || arm.mode() == Arm::Mode::Current)
+      arm.enable(Arm::Mode::Joint);
+    arm.trajAbort();
+  }
+  last_rc_switch = rc.switch_;
 }
 
 // 板载LED指示灯效果

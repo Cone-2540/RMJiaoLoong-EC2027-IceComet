@@ -4,6 +4,9 @@
 # VSCode
 .vscode/
 
+# 参考资料
+references/
+
 # CLion
 .idea/
 

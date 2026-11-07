@@ -31,7 +31,7 @@ class Arm {
     float k_acc[2];  // 输出指令 / (rad/s²)
   };
 
-  enum class Mode { Disabled, Joint };
+  enum class Mode { Disabled, Joint, Speed, Current };
 
   Arm(Motor& joint0, Motor& joint1, const Limits& limits,
       const Feedforward& feedforward);
@@ -39,8 +39,10 @@ class Arm {
   // 仅失能且反馈有效时按已知姿态标定
   bool calibrate(float q0_rad, float q1_rad);
   // 以当前位置为目标使能
-  bool enable();
+  bool enable(Mode mode = Mode::Joint);
   void disable();
+  bool setJointSpeed(float speed0, float speed1);  // rad/s
+  bool setJointCurrent(float current0, float current1);  // C620 原始指令
   // 轨迹中拒绝外部参考；越限返回 false
   bool setReference(const Reference& reference);
   // 手动关节速度输入，内部积分并处理限位；单位 rad/s、s
@@ -80,6 +82,8 @@ class Arm {
   Reference reference_{};
   Mode mode_{Mode::Disabled};
   bool calibrated_{false};
+  float speed_reference_[2]{};
+  float current_reference_[2]{};
   ArmTrajectory trajectory_{};
   TrajectoryType trajectory_type_{TrajectoryType::None};
   bool trajectory_finished_{false};

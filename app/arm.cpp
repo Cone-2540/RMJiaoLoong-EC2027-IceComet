@@ -5,6 +5,7 @@
 #include "arm.h"
 #include <cmath>
 #include "base/common/math.h"
+#include "main.h"
 
 Arm::Arm(Motor& joint0, Motor& joint1, const Limits& limits,
          const Feedforward& feedforward)
@@ -127,15 +128,62 @@ bool Arm::setJointCurrent(float current0, float current1) {
 }
 
 bool Arm::trajectoryReady() {
-  return false;
+  if (mode_ != Mode::Joint || !calibrated_ || trajRunning() || !feedbackReady())
+    return false;
+  updateFeedback();
+  return withinLimits(state_.q) && withinLimits(reference_.q);
 }
 
-bool Arm::trajStart(float, float, float) {
-  return false;
+bool Arm::trajStart(float x, float y, float duration_s) {
+  if (!std::isfinite(duration_s) || duration_s <= 0.f || duration_s > 2147483.f ||
+      !trajectoryReady()) return false;
+  const CartesianReference start = ArmKinematics::forward(reference_.q);
+  CartesianReference end{};
+  end.x = x; end.y = y;
+  if (!ArmKinematics::lineReachable(start, end)) return false;
+
+  // 整段固定肘支；伸直/折叠的临界姿态沿用上一次的选择。
+  int elbow = trajectory_elbow_;
+  const float sin_q1 = sinf(reference_.q[1]);
+  if (fabsf(sin_q1) > 1e-5f) elbow = sin_q1 > 0.f ? 1 : -1;
+  float previous_q[2] = {reference_.q[0], reference_.q[1]};
+  // 几何可达性已解析判断；这里另检查沿途的累计关节角限位。
+  for (int i = 0; i <= 128; ++i) {
+    const float u = i / 128.f;
+    CartesianReference point{};
+    point.x = start.x + (end.x - start.x) * u;
+    point.y = start.y + (end.y - start.y) * u;
+    float q[2];
+    if (!ArmKinematics::inverse(point, previous_q, elbow, q) || !withinLimits(q))
+      return false;
+    previous_q[0] = q[0]; previous_q[1] = q[1];
+  }
+  if (!trajectory_.start(start, end, duration_s)) return false;
+  trajectory_elbow_ = elbow;
+  trajectory_start_tick_ = HAL_GetTick();
+  trajectory_type_ = TrajectoryType::Cartesian;
+  trajectory_finished_ = false;
+  reference_.dq[0] = reference_.dq[1] = 0.f;
+  reference_.ddq[0] = reference_.ddq[1] = 0.f;
+  return true;
 }
 
-bool Arm::trajStartJoint(float, float, float) {
-  return false;
+bool Arm::trajStartJoint(float q0, float q1, float duration_s) {
+  const float end[2] = {q0, q1};
+  if (!std::isfinite(duration_s) || duration_s <= 0.f || duration_s > 2147483.f ||
+      !withinLimits(end) || !trajectoryReady()) return false;
+  // 两轴使用相同的归一化时间，从实际反馈同步起步。
+  for (int i = 0; i < 2; ++i) {
+    joint_trajectory_start_[i] = state_.q[i];
+    joint_trajectory_end_[i] = end[i];
+    reference_.q[i] = state_.q[i];
+    reference_.dq[i] = reference_.ddq[i] = 0.f;
+  }
+  joint_trajectory_duration_ = duration_s;
+  trajectory_start_tick_ = HAL_GetTick();
+  trajectory_type_ = TrajectoryType::Joint;
+  trajectory_finished_ = false;
+  return true;
 }
 
 void Arm::trajAbort() {
@@ -148,6 +196,40 @@ void Arm::trajAbort() {
 }
 
 void Arm::trajectoryPlanner() {
+  if (!trajRunning()) return;
+  if (mode_ != Mode::Joint) {
+    trajAbort();
+    return;
+  }
+  // 无符号相减允许系统毫秒计数跨过一次溢出。
+  const float elapsed_s = (HAL_GetTick() - trajectory_start_tick_) * 0.001f;
+  Reference next{};
+  bool finished = false;
+  if (trajectory_type_ == TrajectoryType::Cartesian) {
+    const CartesianReference point = trajectory_.sample(elapsed_s);
+    if (!ArmKinematics::inverse(point, reference_.q, trajectory_elbow_, next.q)) {
+      trajAbort();
+      return;
+    }
+    finished = !trajectory_.running();
+  } else {
+    for (int i = 0; i < 2; ++i) {
+      float velocity, acceleration;
+      ArmTrajectory::interpolate(joint_trajectory_start_[i], joint_trajectory_end_[i],
+                                 elapsed_s, joint_trajectory_duration_, next.q[i],
+                                 velocity, acceleration);
+    }
+    finished = elapsed_s >= joint_trajectory_duration_;
+  }
+  // 3.3 先接入位置参考，保持已经调好的双环；前馈留到后续单独比较。
+  if (!applyReference(next)) {
+    trajAbort();
+    return;
+  }
+  if (finished) {
+    trajectory_type_ = TrajectoryType::None;
+    trajectory_finished_ = true;
+  }
 }
 
 void Arm::updateFeedback() {

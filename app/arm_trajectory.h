@@ -4,7 +4,7 @@
 #include "arm_kinematics.h"
 
 // 单段直线、五次时间插值，两端速度和加速度为零
-// 必做完成位置输出，解析速度与加速度列为进阶任务
+// 同时计算解析速度、加速度，供前馈和观察使用
 class ArmTrajectory {
  public:
   bool start(const CartesianReference& start, const CartesianReference& end,
@@ -18,7 +18,7 @@ class ArmTrajectory {
   bool running() const { return running_; }
 
  private:
-  CartesianReference start_{}, end_{};
+  CartesianReference start_{}, end_{}, last_{};
   float duration_s_{};
   bool running_{false};
 };

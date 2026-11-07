@@ -28,7 +28,7 @@ class PID {
   float i_max_, out_max_;
   float output_;
 
-  // 微分项低通滤波器
+  // D 项 EMA 低通滤波器；构造函数最后一项为系数，1 表示不滤波。
   LowPassFilter d_filter_;
 
  protected:

@@ -11,6 +11,7 @@
 #include "app/control.h"
 #include "app/arm.h"
 #include "app/manual_config.h"
+#include <cmath>
 
 #include "iwdg.h"
 
@@ -60,6 +61,7 @@ volatile bool arm_start_ok = false;  // 最近一次轨迹是否启动成功
 uint32_t manual_mode = 0;  // 0 失能，1 位置，2 速度，3 电流
 uint32_t calibration_ok = 0;
 uint32_t rc_connected = 0;
+uint32_t led_status = LED_RC_LOST;
 
 // 控制初始化
 void controlInit(void) {
@@ -200,36 +202,81 @@ void robotControl(void) {
   last_rc_switch = rc.switch_;
 }
 
-// 板载LED指示灯效果
+// 先显示阻止使能的原因，再显示实际运行模式。
 void boardLedHandle(void) {
+  const bool motor0_ready = J0.connect_.check() && J0.mode_ != Motor::INIT;
+  const bool motor1_ready = J1.connect_.check() && J1.mode_ != Motor::INIT;
+  if (!rc_connected) {
+    led_status = LED_RC_LOST;
+  } else if (robot_state == STOP || rc.switch_.r == decltype(rc)::DOWN) {
+    led_status = LED_STOPPED;
+  } else if (!motor0_ready && !motor1_ready) {
+    led_status = LED_BOTH_MOTORS_LOST;
+  } else if (!motor0_ready) {
+    led_status = LED_J0_LOST;
+  } else if (!motor1_ready) {
+    led_status = LED_J1_LOST;
+  } else if (!std::isfinite(J0.realAngle()) || !std::isfinite(J1.realAngle()) ||
+             !std::isfinite(J0.realSpeed()) || !std::isfinite(J1.realSpeed())) {
+    led_status = LED_FEEDBACK_INVALID;
+  } else if (!arm.calibrated()) {
+    led_status = LED_NEED_CALIBRATION;
+  } else if (rc.switch_.l == decltype(rc)::MID && rc.switch_.r == decltype(rc)::MID) {
+    led_status = LED_CALIBRATED;
+  } else if (arm.mode() == Arm::Mode::Joint) {
+    led_status = rc.switch_.l == decltype(rc)::UP && rc.switch_.r == decltype(rc)::UP
+                   ? LED_POSITION : LED_HOLDING;
+  } else if (arm.mode() == Arm::Mode::Speed) {
+    led_status = LED_SPEED;
+  } else if (arm.mode() == Arm::Mode::Current) {
+    led_status = LED_CURRENT;
+  } else {
+    led_status = LED_DISABLED;
+  }
+
 #ifdef DBC
-  if (robot_state == STOP) {
-    led.setColor(255, 0, 0);  // red
-    led.setModeOn();
-  } else if (robot_state == STARTUP) {
-    led.setColor(150, 150, 0);  // yellow
-    led.setModeBreath();
-  } else if (robot_state == WORKING) {
-    led.setColor(0, 0, 255);  // blue
-    if (rc.switch_.l == decltype(rc)::UP && rc.switch_.r == decltype(rc)::UP) {
-      // 遥控器挡位左上右上
-      led.setModeBlink(1);
-    } else if (rc.switch_.l == decltype(rc)::MID && rc.switch_.r == decltype(rc)::UP) {
-      // 遥控器挡位左中右上
-      led.setModeBlink(2);
-    } else if (rc.switch_.l == decltype(rc)::DOWN && rc.switch_.r == decltype(rc)::UP) {
-      // 遥控器挡位左下右上
-      led.setModeBlink(3);
-    } else if (rc.switch_.l == decltype(rc)::UP && rc.switch_.r == decltype(rc)::MID) {
-      // 遥控器挡位左上右中
-      led.setModeBlink(4);
-    } else if (rc.switch_.l == decltype(rc)::MID && rc.switch_.r == decltype(rc)::MID) {
-      // 遥控器挡位左中右中
-      led.setModeBlink(5);
-    } else if (rc.switch_.l == decltype(rc)::DOWN && rc.switch_.r == decltype(rc)::MID) {
-      // 遥控器挡位左下右中
-      led.setModeBlink(6);
-    }
+  led.setModeOn();
+  switch (led_status) {
+    case LED_RC_LOST:
+      led.setColor(255, 0, 0);       // 红色快闪：未收到遥控数据
+      led.setModeBlink(1, 100, 100);
+      break;
+    case LED_STOPPED:
+      led.setColor(255, 0, 0);       // 红色常亮：遥控在线，右下失能
+      break;
+    case LED_J0_LOST:
+    case LED_J1_LOST:
+    case LED_BOTH_MOTORS_LOST:
+      led.setColor(255, 80, 0);      // 橙色：每组闪 1/2/3 次表示 J0/J1/两台无反馈
+      led.setModeBlink(led_status == LED_J0_LOST ? 1 :
+                       led_status == LED_J1_LOST ? 2 : 3);
+      break;
+    case LED_FEEDBACK_INVALID:
+      led.setColor(255, 80, 0);      // 橙色常亮：角度或速度不是有效数值
+      break;
+    case LED_NEED_CALIBRATION:
+      led.setColor(255, 255, 0);     // 黄色：反馈正常，尚未标定
+      break;
+    case LED_CALIBRATED:
+      led.setColor(0, 255, 255);     // 青色：零位标定成功，仍处于失能状态
+      break;
+    case LED_POSITION:
+      led.setColor(0, 255, 0);       // 绿色：位置双环已使能
+      break;
+    case LED_SPEED:
+      led.setColor(0, 0, 255);       // 蓝色：速度环已使能
+      break;
+    case LED_CURRENT:
+      led.setColor(255, 0, 255);     // 紫色：直接电流已使能
+      break;
+    case LED_HOLDING:
+      led.setColor(0, 255, 0);       // 绿色呼吸：保持位置
+      led.setModeBreath();
+      break;
+    default:
+      led.setColor(255, 255, 255);   // 白色闪烁：已标定但未使能，回中后重新拨挡
+      led.setModeBlink();
+      break;
   }
   led.handle();
 #elif defined DBA

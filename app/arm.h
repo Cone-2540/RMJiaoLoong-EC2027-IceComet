@@ -49,6 +49,15 @@ class Arm {
   bool addJointReference(float speed0, float speed1, float dt_s = 0.001f);
   // 从当前规划目标起步，沿用其肘支和累计圈数；单位 m、s
   bool trajStart(float x_m, float y_m, float duration_s);
+  bool trajStartCircle(float duration_s); // 从当前规划位置绕原点顺时针一圈
+  // 圆角方形先分批预检，再到起点；准备完成后启动整圈解析轨迹。
+  bool trajPrepareRoundedSquare(float side, float radius, float duration_s, float prepare_s);
+  bool trajStartRoundedSquare();
+  // 上传路径先完整预检，再关节空间到起点；到达后 trajStartPath() 连续绘制。
+  bool trajPreparePath(const ArmTrajectory::Point* points, uint32_t count,
+                       float speed_mps, float prepare_s);
+  bool trajStartPath();
+  float pathDuration() const { return trajectory_.pathDuration(); }
   // 从实际反馈开始的关节空间同步点到点，目标为累计角度 rad
   bool trajStartJoint(float q0_rad, float q1_rad, float duration_s);
   // 仅空闲时设置轨迹速度前馈倍率；0 关闭，1 为解析速度全量前馈。
@@ -67,13 +76,14 @@ class Arm {
   bool calibrated() const { return calibrated_; }
 
  private:
-  enum class TrajectoryType { None, Cartesian, Joint };
+  enum class TrajectoryType { None, Cartesian, Joint, PathCheck, RoundedCheck };
   bool feedbackReady();
   bool trajectoryReady();
   bool withinLimits(const float q[2]) const;
   bool applyReference(const Reference& reference);
   void updateFeedback();
   void trajectoryPlanner();
+  void pathCheck();
   void writeMotorCommands();
 
   Motor& joint0_;
@@ -95,6 +105,9 @@ class Arm {
   float joint_trajectory_end_[2]{};
   float joint_trajectory_duration_{};
   float trajectory_speed_gain_[2]{};
+  uint32_t path_check_segment_{}, path_check_sample_{};
+  float path_check_previous_[2]{}, path_check_first_[2]{}, path_prepare_s_{};
+  CartesianReference path_check_last_{};
 };
 
 #endif  // DOUBLE_JOINTED_ROBOTIC_ARM_ARM_H

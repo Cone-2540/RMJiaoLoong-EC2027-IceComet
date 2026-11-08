@@ -15,6 +15,7 @@
 #include "hardware_config.h"
 
 #include "app/arm.h"
+#include <limits>
 #include "app/can_monitor.h"
 #include "app/control.h"
 // #include "app/imu_monitor.h"
@@ -34,8 +35,10 @@ RC rc(RC_UART);
 RC rc;
 #endif  // RC_UART
 
-// 累计关节角范围为 ±3600°，单位 rad。
-const Arm::Limits arm_limits = {{math::deg2rad(-3600.f), math::deg2rad(-3600.f)}, {math::deg2rad(3600.f),math::deg2rad(3600.f)}};
+// 不设累计圈数限制；非有限反馈、掉线、遥控停机仍会失能。
+const Arm::Limits arm_limits = {
+    {-std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()},
+    {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()}};
 // 加速度前馈系数 加速度-》力矩没建模
 const Arm::Feedforward arm_feedforward = {{0.0f, 0.0f}};
 Arm arm(J0, J1, arm_limits, arm_feedforward);

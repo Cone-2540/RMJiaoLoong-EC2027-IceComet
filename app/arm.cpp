@@ -168,6 +168,33 @@ bool Arm::trajStart(float x, float y, float duration_s) {
   return true;
 }
 
+bool Arm::trajStartCircle(float duration_s) {
+  if (!std::isfinite(duration_s) || duration_s <= 0.f || duration_s > 2147483.f ||
+      !trajectoryReady()) return false;
+  const CartesianReference start = ArmKinematics::forward(reference_.q);
+  int elbow = trajectory_elbow_;
+  const float sin_q1 = sinf(reference_.q[1]);
+  if (fabsf(sin_q1) > 1e-5f) elbow = sin_q1 > 0.f ? 1 : -1;
+  float previous[2] = {reference_.q[0], reference_.q[1]};
+  for (int i = 0; i <= 128; ++i) {
+    const float angle = -6.28318530718f * i / 128.f;
+    CartesianReference point{};
+    point.x = start.x * cosf(angle) - start.y * sinf(angle);
+    point.y = start.x * sinf(angle) + start.y * cosf(angle);
+    float q[2];
+    if (!ArmKinematics::inverse(point, previous, elbow, q) || !withinLimits(q)) return false;
+    previous[0] = q[0]; previous[1] = q[1];
+  }
+  if (!trajectory_.startCircle(start, duration_s)) return false;
+  trajectory_elbow_ = elbow;
+  trajectory_start_tick_ = HAL_GetTick();
+  trajectory_type_ = TrajectoryType::Cartesian;
+  trajectory_finished_ = false;
+  reference_.dq[0] = reference_.dq[1] = 0.f;
+  reference_.ddq[0] = reference_.ddq[1] = 0.f;
+  return true;
+}
+
 bool Arm::trajStartJoint(float q0, float q1, float duration_s) {
   const float end[2] = {q0, q1};
   if (!std::isfinite(duration_s) || duration_s <= 0.f || duration_s > 2147483.f ||
@@ -195,9 +222,96 @@ void Arm::trajAbort() {
   }
 }
 
+bool Arm::trajPreparePath(const ArmTrajectory::Point* points, uint32_t count,
+                          float speed, float prepare_s) {
+  if (!std::isfinite(prepare_s) || prepare_s <= 0.f || prepare_s > 2147483.f ||
+      !trajectoryReady() || !trajectory_.configurePath(points, count, speed)) return false;
+  path_check_previous_[0]=reference_.q[0]; path_check_previous_[1]=reference_.q[1];
+  path_check_segment_=path_check_sample_=0;
+  path_prepare_s_=prepare_s;
+  trajectory_type_=TrajectoryType::PathCheck;
+  trajectory_finished_=false;
+  return true;
+}
+
+void Arm::pathCheck() {
+  // 分段采样检查实际平滑曲线，检查点之间再排除穿过内侧盲区。
+  // 每毫秒最多检查 8 点，长轨迹也不阻塞 CAN、反馈和看门狗。
+  for (int budget=0; budget<8; ++budget) {
+    const uint32_t segment=path_check_segment_, k=path_check_sample_;
+    const bool rounded = trajectory_type_ == TrajectoryType::RoundedCheck;
+    uint32_t samples;
+    CartesianReference point{};
+    if (rounded) {
+      // 五次时间律峰值为平均速度的 1.875 倍，采样间距不超过约 0.5 mm。
+      samples=static_cast<uint32_t>(1.875f*trajectory_.roundedSquareLength()/.0005f)+32;
+      point=trajectory_.roundedSquareSample(trajectory_.roundedSquareDuration()*k/samples);
+    } else {
+      const auto a=trajectory_.pathPoint(segment), b=trajectory_.pathPoint(segment+1);
+      samples=static_cast<uint32_t>(hypotf(b.x-a.x,b.y-a.y)/.0005f)+32;
+      const float begin=trajectory_.pathTime(segment);
+      const float duration=trajectory_.pathTime(segment+1)-begin;
+      point=trajectory_.pathSample(begin+duration*k/samples);
+    }
+    float q[2],dq[2],ddq[2];
+    if (!ArmKinematics::inverse(point,path_check_previous_,1,q) || !withinLimits(q) ||
+        !ArmKinematics::derivatives(point,q,dq,ddq) ||
+        ((segment || k) && !ArmKinematics::lineReachable(path_check_last_,point))) {
+      trajAbort(); return;
+    }
+    if (segment==0 && k==0) { path_check_first_[0]=q[0];path_check_first_[1]=q[1]; }
+    path_check_previous_[0]=q[0];path_check_previous_[1]=q[1];path_check_last_=point;
+    if (++path_check_sample_ > samples) { ++path_check_segment_;path_check_sample_=0; }
+    if ((rounded && path_check_segment_ == 1) ||
+        (!rounded && path_check_segment_+1 == trajectory_.pathCount())) {
+      trajectory_type_=TrajectoryType::None;
+      trajectory_elbow_=1;
+      // 全路径通过后才允许做预备动作；取消后不会保留待执行请求。
+      if (!trajStartJoint(path_check_first_[0],path_check_first_[1],path_prepare_s_)) trajAbort();
+      return;
+    }
+  }
+}
+
+bool Arm::trajPrepareRoundedSquare(float side, float radius, float duration, float prepare_s) {
+  if (!std::isfinite(prepare_s) || prepare_s <= 0.f || prepare_s > 2147483.f ||
+      !trajectoryReady() || !trajectory_.configureRoundedSquare(side,radius,duration)) return false;
+  path_check_previous_[0]=reference_.q[0]; path_check_previous_[1]=reference_.q[1];
+  path_check_segment_=path_check_sample_=0;
+  path_prepare_s_=prepare_s;
+  trajectory_type_=TrajectoryType::RoundedCheck;
+  trajectory_finished_=false;
+  return true;
+}
+
+bool Arm::trajStartRoundedSquare() {
+  if (!trajectoryReady()) return false;
+  const auto current=ArmKinematics::forward(reference_.q);
+  const auto start=trajectory_.roundedSquareSample(0.f);
+  if (hypotf(current.x-start.x,current.y-start.y)>1e-5f ||
+      !trajectory_.startRoundedSquare()) return false;
+  trajectory_elbow_=1;
+  trajectory_start_tick_=HAL_GetTick();
+  trajectory_type_=TrajectoryType::Cartesian;
+  trajectory_finished_=false;
+  return true;
+}
+
+bool Arm::trajStartPath() {
+  if (!trajectoryReady()) return false;
+  const auto current = ArmKinematics::forward(reference_.q);
+  const auto start = trajectory_.pathStart();
+  if (hypotf(current.x-start.x,current.y-start.y) > 1e-5f || !trajectory_.startPath()) return false;
+  trajectory_elbow_ = 1;
+  trajectory_start_tick_ = HAL_GetTick();
+  trajectory_type_ = TrajectoryType::Cartesian;
+  trajectory_finished_ = false;
+  return true;
+}
+
 bool Arm::setTrajectorySpeedGain(float gain0, float gain1) {
   if (trajRunning() || !std::isfinite(gain0) || !std::isfinite(gain1) ||
-      gain0 < 0.f || gain0 > 1.5f || gain1 < 0.f || gain1 > 1.5f) return false;
+      gain0 < 0.f || gain1 < 0.f) return false;
   trajectory_speed_gain_[0] = gain0;
   trajectory_speed_gain_[1] = gain1;
   return true;
@@ -209,6 +323,8 @@ void Arm::trajectoryPlanner() {
     trajAbort();
     return;
   }
+  if (trajectory_type_ == TrajectoryType::PathCheck ||
+      trajectory_type_ == TrajectoryType::RoundedCheck) { pathCheck(); return; }
   // 无符号相减允许系统毫秒计数跨过一次溢出。
   const float elapsed_s = (HAL_GetTick() - trajectory_start_tick_) * 0.001f;
   Reference next{};

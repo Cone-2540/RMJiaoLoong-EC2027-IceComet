@@ -11,9 +11,11 @@
 
 #include "app/motor_monitor.h"
 #include "app/manual_config.h"
+#include "app/step_config.h"
 #include "app/arm.h"
 #include "base/common/math.h"
 #include "lib/arm_math/arm_math.h"
+#include <limits>
 
 // Motor parameter config
 // 电机参数配置
@@ -58,16 +60,16 @@ const Motor::KFParam_t joint_kf_param(5.f, 6e5f, 1.f);
 // D 项 EMA 系数，范围 (0, 1]；越小越平滑，1 表示不滤波。
 constexpr float joint_d_filter_k = 0.1f;
 // 参数顺序：Kp、Ki、Kd、积分误差累加上限、输出上限、D 项 EMA 系数、误差软死区。
-const PID J0_spid(30,0.01,0,0,manual::current_limit * manual::current_to_raw,joint_d_filter_k);
-const PID J0_ppid(75,0,230,0,1440,joint_d_filter_k,manual::j0_position_deadband);
+const PID J0_spid(30,0.01,0,0,manual::j0_current_limit * manual::current_to_raw,joint_d_filter_k);
+const PID J0_ppid(75,0,230,0,std::numeric_limits<float>::max(),joint_d_filter_k,manual::j0_position_deadband);
 // 同步轮实测 40.43 / 64.68 mm，暂沿用原方向符号。
 Motor J0(Motor::M3508, manual::j0_ratio, Motor::POSITION_SPEED,
          J0_ppid,           // ppid
          J0_spid,           // spid
          true, joint_kf_param);  // 启用在线 KF
 
-const PID J1_spid(12,0,50,0,manual::current_limit * manual::current_to_raw,joint_d_filter_k);
-const PID J1_ppid( 50,0,75,0,1440,joint_d_filter_k,manual::j1_position_deadband);
+const PID J1_spid(12,0,50,0,manual::j1_current_limit * manual::current_to_raw,joint_d_filter_k);
+const PID J1_ppid( 50,0,75,0,std::numeric_limits<float>::max(),joint_d_filter_k,manual::j1_position_deadband);
 Motor J1(Motor::M3508, manual::j1_ratio, Motor::POSITION_SPEED,
          J1_ppid,
          J1_spid,
@@ -75,6 +77,34 @@ Motor J1(Motor::M3508, manual::j1_ratio, Motor::POSITION_SPEED,
 
 MotorDebugData j0_debug{}, j1_debug{};
 extern Arm arm;
+
+void setJointStepProfile(bool enabled) {
+  static bool active = false;
+  static PID saved_position[2], saved_speed[2];
+  if (active == enabled) return;
+  Motor* joints[2] = {&J0, &J1};
+  for (int j = 0; j < 2; ++j) {
+    Motor& motor = *joints[j];
+    if (enabled) {
+      saved_position[j] = motor.ppid_;
+      saved_speed[j] = motor.spid_;
+      const auto& p = step::position[j];
+      const auto& s = step::speed[j];
+      motor.ppid_ = PID(p.kp, p.ki, p.kd, p.i_max, saved_position[j].out_max_,
+                        step::d_filter, step::position_deadband[j]);
+      motor.spid_ = PID(s.kp, s.ki, s.kd, s.i_max, saved_speed[j].out_max_, step::d_filter);
+      const Motor::KFParam_t filter(5.f, step::kf_q_speed[j], 1.f);
+      motor.kf_.setQR(filter.Q, filter.R);
+    } else {
+      motor.ppid_ = saved_position[j];
+      motor.spid_ = saved_speed[j];
+      motor.kf_.setQR(joint_kf_param.Q, joint_kf_param.R);
+    }
+    motor.ppid_.reset();
+    motor.spid_.reset();
+  }
+  active = enabled;
+}
 
 static void updateDebug(Motor& motor, MotorDebugData& debug) {
   debug.target_deg = motor.targetAngle();
@@ -226,8 +256,8 @@ void allMotorsInit(void) {
   // KF 输出仍使用 deg、deg/s；位置环和速度环都使用滤波反馈
   J0.setFdbSrc(&J0.kfAngle(), &J0.kfSpeed());
   J1.setFdbSrc(&J1.kfAngle(), &J1.kfSpeed());
-  J0.info_.max_intensity = J1.info_.max_intensity =
-      manual::current_limit * manual::current_to_raw;
+  J0.info_.max_intensity = manual::j0_current_limit * manual::current_to_raw;
+  J1.info_.max_intensity = manual::j1_current_limit * manual::current_to_raw;
 }
 
 // Handle all motors. Called in motorTask

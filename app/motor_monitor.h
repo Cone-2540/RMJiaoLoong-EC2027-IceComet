@@ -31,6 +31,9 @@ void allMotorsInit(void);
 // 电机统一处理
 void allMotorsHandle(void);
 
+// 左上右上使用任务二参数；退出后恢复原 PID 和 KF 参数。
+void setJointStepProfile(bool enabled);
+
 // Check CAN channel and id of received CAN message
 // 校验接收信息的CAN通道和ID，调用对应回调函数
 void motorsCanRxMsgHandle(CAN_HandleTypeDef* hcan,

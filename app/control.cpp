@@ -11,6 +11,7 @@
 #include "app/control.h"
 #include "app/arm.h"
 #include "app/manual_config.h"
+#include "app/square_config.h"
 #include <cmath>
 
 #include "iwdg.h"
@@ -58,6 +59,9 @@ RC::RCSwitch last_rc_switch;
 
 uint8_t arm_step = 0;  // 0 空闲，1 预备，2~5 依次走向 B、C、D、A
 volatile bool arm_start_ok = false;  // 最近一次轨迹是否启动成功
+SquareDebug square_debug{0, 0, {square::speed_ff_gain[0], square::speed_ff_gain[1]}};
+static float square_return_q[2]{};
+static bool square_return_ready = false;
 uint32_t manual_mode = 0;  // 0 失能，1 位置，2 速度，3 电流
 uint32_t calibration_ok = 0;
 uint32_t rc_connected = 0;
@@ -134,6 +138,9 @@ void robotPowerStateFSM(bool stop_flag) {
 // 重置各功能状态
 void robotReset(void) {
   robot_init_flag = false;
+  if (arm_step != 0 || square_debug.request != 0) square_debug.status = 4;
+  square_debug.request = 0;
+  square_return_ready = false;
   arm_step = 0;
   arm_start_ok = false;
   arm.disable();
@@ -145,6 +152,58 @@ bool robotStartup(void) {
   bool flag = true;
 
   return flag;
+}
+
+// 先检查四条边，再用关节空间轨迹到达 A 点的正肘支姿态。
+static bool squareStart() {
+  if (!arm.setTrajectorySpeedGain(square_debug.speed_gain[0], square_debug.speed_gain[1]))
+    return false;
+  if (!std::isfinite(square::prepare_duration) || square::prepare_duration <= 0.f ||
+      !std::isfinite(square::edge_duration) || square::edge_duration <= 0.f) return false;
+  for (int i = 0; i < 4; ++i) {
+    CartesianReference start{}, end{};
+    start.x = square::vertices[i][0]; start.y = square::vertices[i][1];
+    end.x = square::vertices[(i + 1) % 4][0]; end.y = square::vertices[(i + 1) % 4][1];
+    if (!ArmKinematics::lineReachable(start, end)) return false;
+  }
+  CartesianReference a{};
+  a.x = square::vertices[0][0]; a.y = square::vertices[0][1];
+  float q[2];
+  if (!ArmKinematics::inverse(a, arm.state().q, 1, q)) return false;
+  if (!arm.trajStartJoint(q[0], q[1], square::prepare_duration)) return false;
+  square_return_q[0] = q[0]; square_return_q[1] = q[1];
+  square_return_ready = false;
+  return true;
+}
+
+static void squareHandle() {
+  if (arm_step == 0) return;
+  if (arm.mode() != Arm::Mode::Joint || !arm.calibrated() ||
+      (!arm.trajRunning() && !arm.trajFinished())) {
+    // 掉线或轨迹被取消后，本挡位内不自动重启。
+    arm.trajAbort();
+    arm_step = 0;
+    arm_start_ok = false;
+    square_debug.status = 4;
+    return;
+  }
+  if (!arm.trajFinished()) return;
+  if (arm_step == 5 || arm_step == 6) {
+    square_return_ready = arm_step == 5;
+    arm_step = 0;  // 最后一段到 A，保持终点，不再触发预备动作。
+    square_debug.status = 2;
+    return;
+  }
+  const int vertex = arm_step % 4;  // 预备结束→B，随后 C、D、A。
+  arm_start_ok = arm.trajStart(square::vertices[vertex][0], square::vertices[vertex][1],
+                               square::edge_duration);
+  if (arm_start_ok) {
+    ++arm_step;
+  } else {
+    arm.trajAbort();
+    arm_step = 0;
+    square_debug.status = 4;
+  }
 }
 
 // 机器人控制
@@ -163,6 +222,22 @@ void robotControl(void) {
   const float input1 = stick(rc.channel_.r_col);
   const bool calibrate = rc.switch_.l == decltype(rc)::MID &&
                          rc.switch_.r == decltype(rc)::MID;
+  const bool draw_square = rc.switch_.l == decltype(rc)::MID &&
+                           rc.switch_.r == decltype(rc)::UP;
+  const bool tune_hold = rc.switch_.l == decltype(rc)::UP &&
+                         rc.switch_.r == decltype(rc)::MID;
+  if (!tune_hold && square_debug.request != 0) {
+    square_debug.request = 0;
+    square_debug.status = 3;
+  }
+  if (changed && !draw_square) {
+    if (arm_step != 0) {
+      arm.trajAbort();
+      square_debug.status = 4;
+    }
+    arm_step = 0;
+    arm_start_ok = false;
+  }
   Arm::Mode requested = Arm::Mode::Disabled;
   if (rc.switch_.r == decltype(rc)::UP) {
     if (rc.switch_.l == decltype(rc)::UP) requested = Arm::Mode::Joint;
@@ -175,6 +250,18 @@ void robotControl(void) {
   if (calibrate) {
     arm.disable();
     if (changed) arm.calibrate(0.f, 0.f);
+  } else if (draw_square) {
+    if (changed) {
+      arm.disable();
+      arm_step = 0;
+      arm_start_ok = false;
+      if (centered && arm.enable(Arm::Mode::Joint)) {
+        arm_start_ok = squareStart();
+        if (arm_start_ok) arm_step = 1;
+      }
+      square_debug.status = arm_start_ok ? 1 : 3;
+    }
+    squareHandle();
   } else if (requested != Arm::Mode::Disabled) {
     // 切换模式时摇杆需回中；上电、掉线恢复不会自行重新使能。
     if (changed) {
@@ -197,7 +284,42 @@ void robotControl(void) {
     // 其他挡位保持当前位置；从速度/电流模式退出时重新捕获位置。
     if (arm.mode() == Arm::Mode::Speed || arm.mode() == Arm::Mode::Current)
       arm.enable(Arm::Mode::Joint);
-    arm.trajAbort();
+    const uint32_t request = square_debug.request;
+    square_debug.request = 0;
+    if (request == 2) {
+      arm.trajAbort();
+      arm_step = 0;
+      arm_start_ok = false;
+      square_debug.status = 4;
+    } else if (request != 0) {
+      if (tune_hold && centered && arm_step == 0 &&
+          arm.mode() == Arm::Mode::Joint && arm.calibrated() &&
+          (request == 1 || (request == 3 && square_return_ready))) {
+        if (request == 1) {
+          arm_start_ok = squareStart();
+          if (arm_start_ok) arm_step = 1;
+        } else {
+          // 只回到本次 A 点预备角，不用电脑逐点写目标，避免目标阶梯激励 D 项。
+          arm_start_ok = arm.setTrajectorySpeedGain(1.f, 1.f) &&
+              arm.trajStartJoint(square_return_q[0], square_return_q[1], square::return_duration);
+          if (arm_start_ok) {
+            arm_step = 6;
+            square_return_ready = false;
+          }
+        }
+        square_debug.status = arm_start_ok ? 1 : 3;
+      } else {
+        square_debug.status = 3;
+      }
+    }
+    if (arm_step != 0 && !centered) {
+      arm.disable();  // 调试中出现摇杆输入，立即结束；不自动重启。
+      arm_step = 0;
+      arm_start_ok = false;
+      square_debug.status = 4;
+    }
+    if (arm_step != 0) squareHandle();
+    else arm.trajAbort();
   }
   last_rc_switch = rc.switch_;
 }
@@ -224,8 +346,12 @@ void boardLedHandle(void) {
   } else if (rc.switch_.l == decltype(rc)::MID && rc.switch_.r == decltype(rc)::MID) {
     led_status = LED_CALIBRATED;
   } else if (arm.mode() == Arm::Mode::Joint) {
-    led_status = rc.switch_.l == decltype(rc)::UP && rc.switch_.r == decltype(rc)::UP
-                   ? LED_POSITION : LED_HOLDING;
+    if (arm_step != 0) {
+      led_status = LED_SQUARE;
+    } else {
+      led_status = rc.switch_.l == decltype(rc)::UP && rc.switch_.r == decltype(rc)::UP
+                     ? LED_POSITION : LED_HOLDING;
+    }
   } else if (arm.mode() == Arm::Mode::Speed) {
     led_status = LED_SPEED;
   } else if (arm.mode() == Arm::Mode::Current) {
@@ -271,6 +397,10 @@ void boardLedHandle(void) {
       break;
     case LED_HOLDING:
       led.setColor(0, 255, 0);       // 绿色呼吸：保持位置
+      led.setModeBreath();
+      break;
+    case LED_SQUARE:
+      led.setColor(255, 255, 255);   // 白色呼吸：预备动作或正在画正方形
       led.setModeBreath();
       break;
     default:

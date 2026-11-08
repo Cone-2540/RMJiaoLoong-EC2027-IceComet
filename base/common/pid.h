@@ -18,7 +18,7 @@ class PID {
  public:
   PID(void) : PID(0, 0, 0, 0, 0) {}
   PID(float kp, float ki, float kd, float i_max, float out_max,
-      float d_filter_k = 1);
+      float d_filter_k = 1, float deadband = 0);
 
   void reset(void);
   float calc(float ref, float fdb);
@@ -26,12 +26,14 @@ class PID {
  public:
   float kp_, ki_, kd_;
   float i_max_, out_max_;
+  float deadband_;  // 误差软死区，与输入同单位；0 关闭。区外仅保留超出死区的误差。
   float output_;
 
   // D 项 EMA 低通滤波器；构造函数最后一项为系数，1 表示不滤波。
   LowPassFilter d_filter_;
 
  protected:
+  float errorWithDeadband(float error) const;
   float ref_, fdb_;
   float err_, err_sum_, last_err_;
   float pout_, iout_, dout_;

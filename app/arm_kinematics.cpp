@@ -55,32 +55,37 @@ bool ArmKinematics::lineReachable(const CartesianReference& start,
 
   const float dx = end.x - start.x, dy = end.y - start.y;
   const float length2 = dx * dx + dy * dy;
-  if (length2 == 0.f) return true;
-  // 线段到原点的最近点：两端可达，还要排除中间穿过内侧盲区。
+  if (length2 == 0.f) return true;  // 起终点重合，端点检查已足够。
+  // P(u)=start+u*(end-start)，投影求距原点最近处，再限制到线段 [0,1]。
   float u = -(start.x * dx + start.y * dy) / length2;
   if (u < 0.f) u = 0.f;
   if (u > 1.f) u = 1.f;
   const float x = start.x + u * dx, y = start.y + u * dy;
+  // 最近点也可达，才能排除线段中间穿过内侧盲区。
   return radiusReachable(x * x + y * y);
 }
 
 bool ArmKinematics::derivatives(const CartesianReference& point, const float q[2],
                                float dq[2], float ddq[2]) {
+  // 排除无效输入及伸直/折叠附近的奇异姿态，避免除以接近零的行列式。
   if (!finitePosition(point) || !std::isfinite(point.dx) || !std::isfinite(point.dy) ||
       !std::isfinite(point.ddx) || !std::isfinite(point.ddy) ||
       !std::isfinite(q[0]) || !std::isfinite(q[1]) || fabsf(sinf(q[1])) < min_sin_q1)
     return false;
   const float s0 = sinf(q[0]), c0 = cosf(q[0]);
   const float s01 = sinf(q[0] + q[1]), c01 = cosf(q[0] + q[1]);
+  // 对位置正解求导，构造雅可比矩阵 J，使末端速度 dp = J * dq。
   const float j00 = -l0 * s0 - l1 * s01, j01 = -l1 * s01;
   const float j10 = l0 * c0 + l1 * c01, j11 = l1 * c01;
   const float det = l0 * l1 * sinf(q[1]);
+  // 解二元方程 dq = J^{-1} * dp，得到两关节角速度（rad/s）。
   const float v0 = (j11 * point.dx - j01 * point.dy) / det;
   const float v1 = (-j10 * point.dx + j00 * point.dy) / det;
-  // J * ddq = ddp - J_dot * dq。
+  // J * ddq = ddp - J_dot * dq；ax、ay 加回移项后的向心加速度项。
   const float v01 = v0 + v1;
   const float ax = point.ddx + l0 * c0 * v0 * v0 + l1 * c01 * v01 * v01;
   const float ay = point.ddy + l0 * s0 * v0 * v0 + l1 * s01 * v01 * v01;
+  // 用同一个 J 求解关节角加速度（rad/s²），全部有效后再写入输出。
   const float a0 = (j11 * ax - j01 * ay) / det;
   const float a1 = (-j10 * ax + j00 * ay) / det;
   if (!std::isfinite(v0) || !std::isfinite(v1) || !std::isfinite(a0) || !std::isfinite(a1))

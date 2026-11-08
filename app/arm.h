@@ -51,6 +51,8 @@ class Arm {
   bool trajStart(float x_m, float y_m, float duration_s);
   // 从实际反馈开始的关节空间同步点到点，目标为累计角度 rad
   bool trajStartJoint(float q0_rad, float q1_rad, float duration_s);
+  // 仅空闲时设置轨迹速度前馈倍率；0 关闭，1 为解析速度全量前馈。
+  bool setTrajectorySpeedGain(float gain0, float gain1);
   // 停止推进并保持位置参考，清除速度和加速度前馈
   void trajAbort();
   bool trajRunning() const { return trajectory_type_ != TrajectoryType::None; }
@@ -92,6 +94,7 @@ class Arm {
   float joint_trajectory_start_[2]{};
   float joint_trajectory_end_[2]{};
   float joint_trajectory_duration_{};
+  float trajectory_speed_gain_[2]{};
 };
 
 #endif  // DOUBLE_JOINTED_ROBOTIC_ARM_ARM_H

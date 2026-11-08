@@ -195,6 +195,14 @@ void Arm::trajAbort() {
   }
 }
 
+bool Arm::setTrajectorySpeedGain(float gain0, float gain1) {
+  if (trajRunning() || !std::isfinite(gain0) || !std::isfinite(gain1) ||
+      gain0 < 0.f || gain0 > 1.5f || gain1 < 0.f || gain1 > 1.5f) return false;
+  trajectory_speed_gain_[0] = gain0;
+  trajectory_speed_gain_[1] = gain1;
+  return true;
+}
+
 void Arm::trajectoryPlanner() {
   if (!trajRunning()) return;
   if (mode_ != Mode::Joint) {
@@ -211,6 +219,14 @@ void Arm::trajectoryPlanner() {
       trajAbort();
       return;
     }
+    if (trajectory_speed_gain_[0] != 0.f || trajectory_speed_gain_[1] != 0.f) {
+      float velocity[2], acceleration[2];
+      if (!ArmKinematics::derivatives(point, next.q, velocity, acceleration)) {
+        trajAbort();
+        return;
+      }
+      for (int i = 0; i < 2; ++i) next.dq[i] = trajectory_speed_gain_[i] * velocity[i];
+    }
     finished = !trajectory_.running();
   } else {
     for (int i = 0; i < 2; ++i) {
@@ -218,10 +234,11 @@ void Arm::trajectoryPlanner() {
       ArmTrajectory::interpolate(joint_trajectory_start_[i], joint_trajectory_end_[i],
                                  elapsed_s, joint_trajectory_duration_, next.q[i],
                                  velocity, acceleration);
+      next.dq[i] = trajectory_speed_gain_[i] * velocity;
     }
     finished = elapsed_s >= joint_trajectory_duration_;
   }
-  // 3.3 先接入位置参考，保持已经调好的双环；前馈留到后续单独比较。
+  // 位置纠偏与轨迹速度前馈相加；加速度前馈仍为零，单独比较速度前馈效果。
   if (!applyReference(next)) {
     trajAbort();
     return;

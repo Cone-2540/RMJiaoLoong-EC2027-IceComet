@@ -57,9 +57,9 @@
 const Motor::KFParam_t joint_kf_param(5.f, 6e5f, 1.f);
 // D 项 EMA 系数，范围 (0, 1]；越小越平滑，1 表示不滤波。
 constexpr float joint_d_filter_k = 0.1f;
-// 参数顺序：Kp、Ki、Kd、积分误差累加上限、输出上限、D 项 EMA 系数。
+// 参数顺序：Kp、Ki、Kd、积分误差累加上限、输出上限、D 项 EMA 系数、误差软死区。
 const PID J0_spid(30,0.01,0,0,manual::current_limit * manual::current_to_raw,joint_d_filter_k);
-const PID J0_ppid(75,0,400,0,1440,joint_d_filter_k);
+const PID J0_ppid(75,0,230,0,1440,joint_d_filter_k,manual::j0_position_deadband);
 // 同步轮实测 40.43 / 64.68 mm，暂沿用原方向符号。
 Motor J0(Motor::M3508, manual::j0_ratio, Motor::POSITION_SPEED,
          J0_ppid,           // ppid
@@ -67,7 +67,7 @@ Motor J0(Motor::M3508, manual::j0_ratio, Motor::POSITION_SPEED,
          true, joint_kf_param);  // 启用在线 KF
 
 const PID J1_spid(12,0,50,0,manual::current_limit * manual::current_to_raw,joint_d_filter_k);
-const PID J1_ppid( 50,0,100,0,1440,joint_d_filter_k);
+const PID J1_ppid( 50,0,75,0,1440,joint_d_filter_k,manual::j1_position_deadband);
 Motor J1(Motor::M3508, manual::j1_ratio, Motor::POSITION_SPEED,
          J1_ppid,
          J1_spid,

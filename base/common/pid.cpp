@@ -14,12 +14,13 @@
 #include "math.h"
 
 PID::PID(float kp, float ki, float kd, float i_max, float out_max,
-         float d_filter_k)
+         float d_filter_k, float deadband)
     : kp_(kp),
       ki_(ki),
       kd_(kd),
       i_max_(i_max),
       out_max_(out_max),
+      deadband_(deadband),
       d_filter_(d_filter_k) {
   err_ = 0;
   err_sum_ = 0;
@@ -36,12 +37,20 @@ void PID::reset(void) {
   d_filter_.reset();
 }
 
+float PID::errorWithDeadband(float error) const {
+  if (!std::isfinite(deadband_) || deadband_ <= 0.f) return error;
+  // 连续软死区：边界处输出从零平滑增长，避免硬切回完整误差产生 D 项尖峰。
+  if (error > deadband_) return error - deadband_;
+  if (error < -deadband_) return error + deadband_;
+  return 0.f;
+}
+
 float PID::calc(float ref, float fdb) {
   ref_ = ref;
   fdb_ = fdb;
 
   last_err_ = err_;
-  err_ = ref_ - fdb_;
+  err_ = errorWithDeadband(ref_ - fdb_);
   err_sum_ = math::limit(err_sum_ + err_, -i_max_, i_max_);
 
   pout_ = kp_ * err_;
@@ -86,7 +95,7 @@ float PIDEx::calc(float ref, float fdb) {
   fdb_ = fdb;
 
   last_err_ = err_;
-  err_ = ref_ - fdb_;
+  err_ = errorWithDeadband(ref_ - fdb_);
 
   float i_input;
   // 梯形积分，优化低频率情况下的 PID

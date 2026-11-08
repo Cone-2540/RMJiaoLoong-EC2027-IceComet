@@ -28,8 +28,20 @@ enum BoardLedStatus {
   LED_SPEED,
   LED_CURRENT,
   LED_HOLDING,
+  LED_SQUARE,
 };
 extern uint32_t led_status;
+extern uint8_t arm_step;              // 0 空闲，1 预备，2/3/4/5 前往 B/C/D/A，6 调试回卷
+extern volatile bool arm_start_ok;    // 自动动作最近一次启动/续段是否成功
+
+// Scope 单次试验入口：仅已使能的左上右中保持挡接受 1 开始、2 取消、3 画完后回卷。
+// 参数先写，request 最后写；不改遥控数据，不自动使能或标定。
+struct SquareDebug {
+  volatile uint32_t request;
+  volatile uint32_t status;  // 0 空闲，1 运行，2 完成，3 拒绝，4 取消/故障
+  float speed_gain[2];      // J0/J1 速度前馈倍率，启动时采纳
+};
+extern SquareDebug square_debug;
 
 // 控制初始化
 void controlInit(void);

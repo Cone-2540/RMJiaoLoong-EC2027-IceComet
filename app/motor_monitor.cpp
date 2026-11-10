@@ -12,7 +12,9 @@
 #include "app/motor_monitor.h"
 #include "app/manual_config.h"
 #include "app/step_config.h"
+#include "app/step_feedforward.h"
 #include "app/arm.h"
+#include "app/control.h"
 #include "base/common/math.h"
 #include "lib/arm_math/arm_math.h"
 #include <limits>
@@ -76,34 +78,135 @@ Motor J1(Motor::M3508, manual::j1_ratio, Motor::POSITION_SPEED,
          true, joint_kf_param);
 
 MotorDebugData j0_debug{}, j1_debug{};
+StepTrace step_trace{};
+StepFeedforward step_feedforward{};
+static bool step_profile_active = false;
+static StepFeedforwardLatch step_bias[2];
 extern Arm arm;
 
+static void updateStepTrace() {
+  static float previous_target[2]{};
+  static uint32_t phase = 0, stride = 1;
+  static uint32_t last_tick = 0;
+  const bool ready = (rc_connected || bench_debug.active) && arm.calibrated() &&
+      arm.mode() == Arm::Mode::Joint && J0.mode_ == Motor::WORKING &&
+      J1.mode_ == Motor::WORKING;
+  if (!ready) {
+    if (step_trace.request || step_trace.status == 1 || step_trace.status == 2)
+      step_trace.status = 4;
+    step_trace.request = 0;
+    if (step_trace.monitor_status == 1) step_trace.monitor_status = 3;
+    return;
+  }
+  if (step_trace.request) {
+    const uint32_t request = step_trace.request;
+    step_trace.request = 0;
+    step_trace.count = 0;
+    step_trace.monitor_status = 0;
+    phase = 0;
+    stride = step_trace.stride >= 1 && step_trace.stride <= 10 ? step_trace.stride : 1;
+    step_trace.stride = stride;
+    previous_target[0] = J0.targetAngle();
+    previous_target[1] = J1.targetAngle();
+    step_trace.status = request == 2 ? 1 : 2;
+  }
+  if (step_trace.status == 1 &&
+      (fabsf(J0.targetAngle() - previous_target[0]) > 1.f ||
+       fabsf(J1.targetAngle() - previous_target[1]) > 1.f))
+    step_trace.status = 2;
+  const uint32_t now = HAL_GetTick();
+  if (step_trace.status == 2 && step_trace.count == 0 && phase == 0) {
+    step_trace.start_ms = last_tick = now;
+    step_trace.elapsed_ms = step_trace.max_gap_ms = 0;
+    step_trace.monitor_status = 1;
+    if (step_trace.monitor_ms < 500 || step_trace.monitor_ms > 10000)
+      step_trace.monitor_ms = 2500;
+    if (!std::isfinite(step_trace.band_deg) || step_trace.band_deg <= 0.f)
+      step_trace.band_deg = .2f;
+    for (int j = 0; j < 2; ++j) {
+      step_trace.last_outside_ms[j] = 0;
+      step_trace.max_error_after_100ms[j] = step_trace.peak_current[j] = 0;
+    }
+    previous_target[0] = J0.targetAngle();
+    previous_target[1] = J1.targetAngle();
+  }
+  if (step_trace.monitor_status == 1) {
+    const uint32_t elapsed = now - step_trace.start_ms, gap = now - last_tick;
+    step_trace.elapsed_ms = elapsed;
+    if (gap > step_trace.max_gap_ms) step_trace.max_gap_ms = gap;
+    last_tick = now;
+    Motor* monitored[2] = {&J0, &J1};
+    for (int j = 0; j < 2; ++j) {
+      Motor& motor = *monitored[j];
+      if (fabsf(motor.targetAngle() - previous_target[j]) > .001f) {
+        step_trace.monitor_status = 3; // 目标再次改变，此段统计作废。
+        break;
+      }
+      const float raw_angle = motor.realAngle() + motor.motor_data_.angle -
+                              *motor.control_data_.fdb_angle_src;
+      const float error = fabsf(motor.targetAngle() - raw_angle);
+      if (error > step_trace.band_deg) step_trace.last_outside_ms[j] = elapsed;
+      if (elapsed >= 100 && error > step_trace.max_error_after_100ms[j])
+        step_trace.max_error_after_100ms[j] = error;
+      const float current = fabsf(motor.intensity_ / manual::current_to_raw);
+      if (current > step_trace.peak_current[j]) step_trace.peak_current[j] = current;
+    }
+    if (step_trace.monitor_status == 1 && elapsed >= step_trace.monitor_ms)
+      step_trace.monitor_status = 2;
+  }
+  if (step_trace.status != 2 || phase++ % stride) return;
+  // 首个样本就是控制器接受新目标的周期，含同周期实际下发电流。
+  StepTraceSample& sample = step_trace.samples[step_trace.count];
+  sample.tick_ms = now;
+  Motor* joints[2] = {&J0, &J1};
+  for (int j = 0; j < 2; ++j) {
+    Motor& motor = *joints[j];
+    sample.target[j] = motor.targetAngle();
+    sample.angle[j] = motor.realAngle();
+    // 原始编码器换到标定后的同一坐标，防止用滤波曲线掩盖实际振动。
+    sample.raw_angle[j] = motor.realAngle() + motor.motor_data_.angle -
+                          *motor.control_data_.fdb_angle_src;
+    sample.speed[j] = motor.realSpeed();
+    sample.current[j] = motor.intensity_ * math::sign(motor.ratio_) / manual::current_to_raw;
+  }
+  if (++step_trace.count == 256) step_trace.status = 3;
+}
+
 void setJointStepProfile(bool enabled) {
-  static bool active = false;
   static PID saved_position[2], saved_speed[2];
-  if (active == enabled) return;
+  static float* saved_speed_source[2]{};
+  if (step_profile_active == enabled) return;
   Motor* joints[2] = {&J0, &J1};
   for (int j = 0; j < 2; ++j) {
     Motor& motor = *joints[j];
     if (enabled) {
       saved_position[j] = motor.ppid_;
       saved_speed[j] = motor.spid_;
+      saved_speed_source[j] = motor.control_data_.fdb_speed_src;
+      motor.control_data_.fdb_speed_src = &motor.kf_data_.x[1];
       const auto& p = step::position[j];
       const auto& s = step::speed[j];
       motor.ppid_ = PID(p.kp, p.ki, p.kd, p.i_max, saved_position[j].out_max_,
-                        step::d_filter, step::position_deadband[j]);
+                        step::position_d_filter[j], step::position_deadband[j]);
+      motor.ppid_.derivative_on_measurement_ = step::position_d_on_measurement[j];
+      motor.ppid_.reference_alpha_ = step::position_reference_alpha[j];
       motor.spid_ = PID(s.kp, s.ki, s.kd, s.i_max, saved_speed[j].out_max_, step::d_filter);
       const Motor::KFParam_t filter(5.f, step::kf_q_speed[j], 1.f);
       motor.kf_.setQR(filter.Q, filter.R);
     } else {
       motor.ppid_ = saved_position[j];
       motor.spid_ = saved_speed[j];
+      motor.control_data_.fdb_speed_src = saved_speed_source[j];
       motor.kf_.setQR(joint_kf_param.Q, joint_kf_param.R);
     }
     motor.ppid_.reset();
     motor.spid_.reset();
+    step_bias[j].reset(motor.realAngle());
+    step_feedforward.positive_a[j] = enabled ? step::positive_current_a[j] : 0.f;
+    step_feedforward.negative_a[j] = enabled ? step::negative_current_a[j] : 0.f;
+    step_feedforward.applied_a[j] = 0.f;
   }
-  active = enabled;
+  step_profile_active = enabled;
 }
 
 static void updateDebug(Motor& motor, MotorDebugData& debug) {
@@ -263,6 +366,16 @@ void allMotorsInit(void) {
 // Handle all motors. Called in motorTask
 // 电机统一处理，在motorTask中调用
 void allMotorsHandle(void) {
+  if (step_profile_active && arm.mode() == Arm::Mode::Joint) {
+    Motor* joints[2] = {&J0, &J1};
+    for (int j=0;j<2;++j) {
+      step_feedforward.applied_a[j] = step_bias[j].update(joints[j]->targetAngle(),
+          step_feedforward.positive_a[j], step_feedforward.negative_a[j]);
+      // Arm 每周期先写入基础前馈；这里仅叠加一次，最终沿用电机原有电流上限。
+      joints[j]->control_data_.feedforward_intensity +=
+          step_feedforward.applied_a[j] * manual::current_to_raw;
+    }
+  }
   for (int i = 0; i < 11; i++) {
     if (can1_dji_motor[i] != nullptr) {
       can1_dji_motor[i]->handle();
@@ -279,6 +392,7 @@ void allMotorsHandle(void) {
   updateDebug(J1, j1_debug);
   manual_mode = static_cast<uint32_t>(arm.mode());
   calibration_ok = arm.calibrated() ? 1u : 0u;
+  updateStepTrace();
 }
 
 // Check CAN channel and id of received CAN message

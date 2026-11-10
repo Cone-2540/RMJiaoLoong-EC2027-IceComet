@@ -4,7 +4,7 @@
 #include "arm_kinematics.h"
 #include <cstdint>
 
-// 单段直线、整圆或多点平滑曲线；起终点速度和加速度为零
+// 单段直线、整圆、圆角方形或多点平滑曲线；起终点速度和加速度为零
 // 同时计算解析速度、加速度，供前馈和观察使用
 class ArmTrajectory {
  public:

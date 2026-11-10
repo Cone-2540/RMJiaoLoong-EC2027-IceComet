@@ -11,6 +11,7 @@
 #ifndef PID_H
 #define PID_H
 
+#include <stdint.h>
 #include "base/common/filter.h"
 
 // PID类
@@ -27,6 +28,8 @@ class PID {
   float kp_, ki_, kd_;
   float i_max_, out_max_;
   float deadband_;  // 误差软死区，与输入同单位；0 关闭。区外仅保留超出死区的误差。
+  uint32_t derivative_on_measurement_ = 0; // 1：D=-Kd*反馈增量，目标阶跃不产生 D 突跳
+  float reference_alpha_ = 1.f; // P 项目标 EMA，1 关闭；反馈与原始目标/误差计时不滤波。
   float output_;
 
   // D 项 EMA 低通滤波器；构造函数最后一项为系数，1 表示不滤波。
@@ -37,6 +40,8 @@ class PID {
   float ref_, fdb_;
   float err_, err_sum_, last_err_;
   float pout_, iout_, dout_;
+  bool measurement_initialized_ = false;
+  float proportional_reference_ = 0.f;
 };
 
 // 改进PID类

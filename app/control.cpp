@@ -12,6 +12,9 @@
 #include "app/arm.h"
 #include "app/manual_config.h"
 #include "app/square_config.h"
+#include "app/logo_config.h"
+#include "app/rm_r_config.h"
+#include "app/oscillation_guard.h"
 #include <cmath>
 
 #include "iwdg.h"
@@ -57,7 +60,7 @@ WFLY::RCSwitch last_rc_switch;
 RC::RCSwitch last_rc_switch;
 #endif
 
-uint8_t arm_step = 0;  // 0 空闲，1~8 尖角方形/圆，9/10 任意轨迹，11/12 圆角方形
+uint8_t arm_step = 0;  // 0 空闲，1~8 方形/圆，9/10 任意轨迹，11/12 圆角方形，13/14 交龙，15/16 RM R
 volatile bool arm_start_ok = false;  // 最近一次轨迹是否启动成功
 SquareDebug square_debug{0, 0, {square::speed_ff_gain[0], square::speed_ff_gain[1]},
                          square::edge_duration,
@@ -74,10 +77,106 @@ static bool square_return_ready = false;
 static bool draw_trigger_ready = false;
 FreehandPath freehand_path{1, 0, 0, square::side_length/square::edge_duration,
                            0, 0.f, {}};
+LogoDebug logo_debug{logo::speed_mps, 0.f, 0, 0};
+LogoDebug rm_r_debug{rm_r::speed_mps, 0.f, 0, 0};
 uint32_t manual_mode = 0;  // 0 失能，1 位置，2 速度，3 电流
 uint32_t calibration_ok = 0;
 uint32_t rc_connected = 0;
 uint32_t led_status = LED_RC_LOST;
+BenchDebug bench_debug{};
+volatile uint32_t j0_step_request = 0;
+volatile uint32_t j1_step_request = 0;
+
+static bool benchControl() {
+  static uint32_t previous_heartbeat = 0, heartbeat_tick = 0;
+  static OscillationGuard vibration[2];
+  static bool watch_session = false;
+  const uint32_t now = HAL_GetTick();
+  const uint32_t step0 = j0_step_request, step1 = j1_step_request;
+  j0_step_request = j1_step_request = 0;
+  const bool watch_step = (step0 == 1) != (step1 == 1);
+  const bool watch_stop = step0 > 1 || step1 > 1 || (step0 == 1 && step1 == 1);
+  uint32_t request = bench_debug.request;
+  bench_debug.request = 0;
+  const bool start_watch = watch_step && !watch_stop && request != 2 &&
+                           (!bench_debug.active || watch_session);
+  if (watch_stop) request = 2;
+  else if (start_watch && !bench_debug.active) request = 1;
+  const bool remote_stop = rc_connected && rc.switch_.r == decltype(rc)::DOWN;
+  if (watch_stop && !bench_debug.active && !watch_session && !rc_connected) {
+    // 先写 2 可在完全撤流状态进入调参窗口，首次阶跃前的在线修改也能保留。
+    robotReset();
+    setJointStepProfile(true);
+    watch_session = true;
+    bench_debug.status = 2;
+    bench_debug.fault = 0;
+  }
+  if (request == 1 && !bench_debug.active) {
+    // Watch 停机后保留 RAM 中手调的 PID；再次触发不重载参数。
+    if (!watch_session || !start_watch) robotReset();
+    // 未机械标定时只建立当前反馈的相对坐标，用于相对 10° 阶跃。
+    const bool calibrated = arm.calibrated() ||
+        arm.calibrate(math::deg2rad(J0.realAngle()), math::deg2rad(J1.realAngle()));
+    if (remote_stop || !calibrated) {
+      bench_debug.status = 3;
+      return true;
+    }
+    setJointStepProfile(true);
+    if (!arm.enable(Arm::Mode::Joint)) {
+      setJointStepProfile(false);
+      bench_debug.status = 3;
+      return true;
+    }
+    previous_heartbeat = bench_debug.heartbeat;
+    heartbeat_tick = now;
+    bench_debug.active = 1;
+    bench_debug.status = 1;
+    bench_debug.fault = 0;
+    bench_debug.fault_axes = 0;
+    watch_session = start_watch;
+    vibration[0].reset(J0.realAngle());
+    vibration[1].reset(J1.realAngle());
+    robot_state = WORKING;
+  }
+  if (!bench_debug.active) {
+    // 手柄重新上线时交还遥控状态机；无手柄时保留停机后的调参窗口。
+    if (watch_session && rc_connected) {watch_session = false; robotReset();}
+    return watch_session || request == 2;
+  }
+  if (bench_debug.heartbeat != previous_heartbeat) {
+    previous_heartbeat = bench_debug.heartbeat;
+    heartbeat_tick = now;
+  }
+  const uint32_t oscillation_axes =
+      (vibration[0].update(J0.realAngle(), now) ? 1u : 0u) |
+      (vibration[1].update(J1.realAngle(), now) ? 2u : 0u);
+  const bool oscillating = oscillation_axes != 0;
+  const bool heartbeat_expired = !watch_session && now - heartbeat_tick > 600;
+  if (request == 2 || remote_stop || oscillating || heartbeat_expired ||
+      arm.mode() != Arm::Mode::Joint || !J0.connect_.check() || !J1.connect_.check() ||
+      !std::isfinite(J0.realAngle()) || !std::isfinite(J1.realAngle()) ||
+      !std::isfinite(J0.realSpeed()) || !std::isfinite(J1.realSpeed())) {
+    bench_debug.active = 0;
+    if (oscillating) bench_debug.fault_axes = oscillation_axes;
+    bench_debug.fault = remote_stop ? 4 : oscillating ? 3 : heartbeat_expired ? 1 : 2;
+    if (request == 2 && !oscillating) bench_debug.fault = 0;
+    bench_debug.status = request == 2 ? 2 : 4;
+    if (watch_session && !remote_stop) arm.disable();
+    else {watch_session = false; robotReset();}
+    robot_state = STOP;
+    return true;
+  }
+  if (start_watch) {
+    Arm::Reference next = arm.reference();
+    next.q[step0 == 1 ? 0 : 1] += math::deg2rad(10.f);
+    if (!arm.setReference(next)) {
+      arm.disable(); bench_debug.active = 0;
+      bench_debug.status = 3; bench_debug.fault = 2;
+      robot_state = STOP;
+    }
+  }
+  return true;
+}
 
 // 控制初始化
 void controlInit(void) {
@@ -104,7 +203,14 @@ void controlInit(void) {
 // 控制主循环
 void controlLoop(void) {
   rc_connected = rc.connect_.check() ? 1u : 0u;
-  iwdgHandler(rc.connect_.check());
+  if (benchControl()) {
+    iwdgHandler(true);
+    arm.handle();
+    boardLedHandle();
+    return;
+  }
+  // 遥控离线由状态机失能；看门狗检查任务是否卡死，空闲时仍应刷新。
+  iwdgHandler(true);
   robotPowerStateFSM(!rc.connect_.check() || rc.switch_.r == decltype(rc)::DOWN);
 
   if (robot_state == STOP) {
@@ -167,6 +273,8 @@ void robotReset(void) {
   square_return_ready = false;
   draw_trigger_ready = false;
   if (arm_step == 9 || arm_step == 10) freehand_path.status = 5;
+  if (arm_step == 13 || arm_step == 14) logo_debug.status = 5;
+  if (arm_step == 15 || arm_step == 16) rm_r_debug.status = 5;
   arm_step = 0;
   arm_start_ok = false;
   arm.disable();
@@ -180,7 +288,7 @@ bool robotStartup(void) {
   return flag;
 }
 
-// 先检查四条边，再用关节空间轨迹到达 A 点的正肘支姿态。
+// 绘制期间使用运动死区，结束或取消时恢复原保持死区。
 static bool squareUseMovingPid() {
   for (int i = 0; i < 2; ++i)
     if (!std::isfinite(square_debug.moving_deadband[i]) || square_debug.moving_deadband[i] < 0.f)
@@ -251,6 +359,21 @@ static bool freehandStart() {
   return true;
 }
 
+static bool logoStart(bool is_rm_r = false) {
+  // 内置点集单独保存在 Flash，不覆盖网页上传的轨迹。
+  LogoDebug& debug = is_rm_r ? rm_r_debug : logo_debug;
+  const auto* points = is_rm_r ? rm_r::points : logo::points;
+  const uint32_t count = is_rm_r ? rm_r::point_count : logo::point_count;
+  if (!arm.setTrajectorySpeedGain(square_debug.speed_gain[0], square_debug.speed_gain[1]) ||
+      !arm.trajPreparePath(points, count, debug.speed_mps, square::prepare_duration)) return false;
+  if (!squareUseMovingPid()) { arm.trajAbort(); return false; }
+  square_return_ready = false;
+  debug.duration_s = arm.pathDuration();
+  debug.cycle_time_ms = 0;
+  debug.status = 1;
+  return true;
+}
+
 static void squareHandle() {
   if (arm_step == 0) return;
   if (arm.mode() != Arm::Mode::Joint || !arm.calibrated() ||
@@ -261,13 +384,30 @@ static void squareHandle() {
     arm_start_ok = false;
     square_debug.status = 4;
     if (freehand_path.status == 1 || freehand_path.status == 2) freehand_path.status = 5;
+    if (logo_debug.status == 1 || logo_debug.status == 2) logo_debug.status = 5;
+    if (rm_r_debug.status == 1 || rm_r_debug.status == 2) rm_r_debug.status = 5;
     return;
   }
   if (!arm.trajFinished()) return;
-  if (arm_step == 9) {
+  if (arm_step == 9 || arm_step == 13 || arm_step == 15) {
+    const bool is_logo = arm_step != 9;
+    const bool is_rm_r = arm_step == 15;
+    LogoDebug& debug = is_rm_r ? rm_r_debug : logo_debug;
     arm_start_ok = arm.trajStartPath();
-    if (arm_start_ok) { arm_step=10; freehand_path.status=2; }
-    else { arm.trajAbort(); arm_step=0; freehand_path.status=5; }
+    if (arm_start_ok) {
+      arm_step = is_rm_r ? 16 : (is_logo ? 14 : 10);
+      if (is_logo) { debug.status=2; square_cycle_start_tick=HAL_GetTick(); }
+      else freehand_path.status=2;
+    } else {
+      arm.trajAbort(); arm_step=0; square_debug.status=4;
+      if (is_logo) debug.status=5; else freehand_path.status=5;
+    }
+    return;
+  }
+  if (arm_step == 14 || arm_step == 16) {
+    LogoDebug& debug = arm_step == 16 ? rm_r_debug : logo_debug;
+    debug.cycle_time_ms=HAL_GetTick()-square_cycle_start_tick;
+    arm_step=0; debug.status=3; square_debug.status=2;
     return;
   }
   if (arm_step == 10) {
@@ -318,6 +458,9 @@ void robotControl(void) {
   }
   const bool centered = fabsf(static_cast<float>(rc.channel_.l_col)) <= manual::stick_deadband &&
                         fabsf(static_cast<float>(rc.channel_.r_col)) <= manual::stick_deadband;
+  const bool horizontal_centered = fabsf(static_cast<float>(rc.channel_.l_row)) <= manual::stick_deadband &&
+                                   fabsf(static_cast<float>(rc.channel_.r_row)) <= manual::stick_deadband;
+  const bool draw_centered = centered && horizontal_centered;
   // 两根竖向摇杆，死区外线性映射到 [-1, 1]。
   const auto stick = [](float value) {
     if (fabsf(value) <= manual::stick_deadband) return 0.f;
@@ -339,6 +482,8 @@ void robotControl(void) {
   if (changed && !draw_square) {
     if (arm_step != 0) {
       if (arm_step == 9 || arm_step == 10) freehand_path.status=5;
+      if (arm_step == 13 || arm_step == 14) logo_debug.status=5;
+      if (arm_step == 15 || arm_step == 16) rm_r_debug.status=5;
       arm.trajAbort();
       square_debug.status = 4;
     }
@@ -362,26 +507,41 @@ void robotControl(void) {
       arm.disable();
       arm_step = 0;
       arm_start_ok = false;
-      const bool enabled = centered && arm.enable(Arm::Mode::Joint);
+      const bool enabled = draw_centered && arm.enable(Arm::Mode::Joint);
       square_debug.status = enabled ? 0 : 3;
     }
-    // 右摇杆下满杆取消任意轨迹并保持当前规划目标。
-    if ((arm_step == 9 || arm_step == 10) &&
+    // 右摇杆下满杆取消网页/Logo 轨迹并保持当前规划目标。
+    if ((arm_step == 9 || arm_step == 10 || (arm_step >= 13 && arm_step <= 16)) &&
         rc.channel_.r_col <= -manual::stick_range * .9f) {
+      if (arm_step == 15 || arm_step == 16) rm_r_debug.status=5;
+      else if (arm_step == 13 || arm_step == 14) logo_debug.status=5;
+      else freehand_path.status=5;
       arm.trajAbort(); arm_step=0; arm_start_ok=false;
-      freehand_path.status=5; draw_trigger_ready=false;
+      draw_trigger_ready=false;
     }
     // 回中后才接受下一次端点动作；忙碌期间不缓存摇杆请求。
     if (arm_step == 0 && arm.mode() == Arm::Mode::Joint && arm.calibrated()) {
-      if (centered) draw_trigger_ready = true;
-      if (draw_trigger_ready && fabsf(static_cast<float>(rc.channel_.l_col)) <= manual::stick_deadband &&
+      if (draw_centered) draw_trigger_ready = true;
+      // 右横向满杆：右为交龙，左为 RM R；其他三轴需回中。
+      if (draw_trigger_ready && centered &&
+          fabsf(static_cast<float>(rc.channel_.l_row)) <= manual::stick_deadband &&
+          fabsf(static_cast<float>(rc.channel_.r_row)) >= manual::stick_range * .9f) {
+        draw_trigger_ready=false;
+        const bool is_rm_r = rc.channel_.r_row < 0;
+        arm_start_ok=logoStart(is_rm_r);
+        if (arm_start_ok) { arm_step=is_rm_r ? 15 : 13; square_debug.status=1; }
+        else { (is_rm_r ? rm_r_debug : logo_debug).status=4; square_debug.status=3; }
+      }
+      if (draw_trigger_ready && horizontal_centered &&
+          fabsf(static_cast<float>(rc.channel_.l_col)) <= manual::stick_deadband &&
           rc.channel_.r_col >= manual::stick_range * .9f) {
         draw_trigger_ready=false;
         arm_start_ok=freehandStart();
         if (arm_start_ok) { arm_step=9; square_debug.status=1; }
         else freehand_path.status=4;
       }
-      if (draw_trigger_ready && fabsf(static_cast<float>(rc.channel_.r_col)) <= manual::stick_deadband &&
+      if (draw_trigger_ready && horizontal_centered &&
+          fabsf(static_cast<float>(rc.channel_.r_col)) <= manual::stick_deadband &&
           fabsf(static_cast<float>(rc.channel_.l_col)) >= manual::stick_range * 0.9f) {
         draw_trigger_ready = false;
         const bool circle = rc.channel_.l_col < 0;
@@ -457,7 +617,9 @@ void robotControl(void) {
 void boardLedHandle(void) {
   const bool motor0_ready = J0.connect_.check() && J0.mode_ != Motor::INIT;
   const bool motor1_ready = J1.connect_.check() && J1.mode_ != Motor::INIT;
-  if (!rc_connected) {
+  if (bench_debug.active) {
+    led_status = LED_BENCH;
+  } else if (!rc_connected) {
     led_status = LED_RC_LOST;
   } else if (robot_state == STOP || rc.switch_.r == decltype(rc)::DOWN) {
     led_status = LED_STOPPED;
@@ -492,6 +654,10 @@ void boardLedHandle(void) {
 #ifdef DBC
   led.setModeOn();
   switch (led_status) {
+    case LED_BENCH:
+      led.setColor(120, 0, 255);     // 紫蓝呼吸：电脑心跳控制，任务二位置双环
+      led.setModeBreath();
+      break;
     case LED_RC_LOST:
       led.setColor(255, 0, 0);       // 红色快闪：未收到遥控数据
       led.setModeBlink(1, 100, 100);

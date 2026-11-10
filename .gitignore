@@ -13,6 +13,7 @@ references/
 # tools
 tools/
 report/
+doc/
 
 # MDK-ARM
 .MDK-ARM

@@ -22,12 +22,13 @@ PID::PID(float kp, float ki, float kd, float i_max, float out_max,
       out_max_(out_max),
       deadband_(deadband),
       d_filter_(d_filter_k) {
-  err_ = 0;
-  err_sum_ = 0;
-  last_err_ = 0;
+  reset();
 }
 
 void PID::reset(void) {
+  ref_ = fdb_ = output_ = 0;
+  measurement_initialized_ = false;
+  proportional_reference_ = 0.f;
   err_ = 0;
   err_sum_ = 0;
   last_err_ = 0;
@@ -46,6 +47,9 @@ float PID::errorWithDeadband(float error) const {
 }
 
 float PID::calc(float ref, float fdb) {
+  if (!measurement_initialized_) proportional_reference_ = fdb;
+  const float feedback_change = measurement_initialized_ ? fdb - fdb_ : 0.f;
+  measurement_initialized_ = true;
   ref_ = ref;
   fdb_ = fdb;
 
@@ -53,9 +57,12 @@ float PID::calc(float ref, float fdb) {
   err_ = errorWithDeadband(ref_ - fdb_);
   err_sum_ = math::limit(err_sum_ + err_, -i_max_, i_max_);
 
-  pout_ = kp_ * err_;
+  const float reference_alpha = std::isfinite(reference_alpha_) && reference_alpha_ > 0.f &&
+                                reference_alpha_ <= 1.f ? reference_alpha_ : 1.f;
+  proportional_reference_ += reference_alpha * (ref - proportional_reference_);
+  pout_ = kp_ * errorWithDeadband(proportional_reference_ - fdb_);
   iout_ = ki_ * err_sum_;
-  dout_ = d_filter_.update(kd_ * (err_ - last_err_));
+  dout_ = d_filter_.update(kd_ * (derivative_on_measurement_ ? -feedback_change : err_ - last_err_));
   output_ = math::limit(pout_ + iout_ + dout_, -out_max_, out_max_);
 
   return output_;

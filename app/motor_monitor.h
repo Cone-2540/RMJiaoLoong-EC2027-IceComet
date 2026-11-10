@@ -53,4 +53,25 @@ struct MotorDebugData {
 extern MotorDebugData j0_debug, j1_debug;
 extern uint32_t manual_mode, calibration_ok, rc_connected;
 
+// 板上记录控制周期，绕过 ST-Link/HTTP 的采样延迟；只记录，不生成运动。
+struct StepTraceSample {
+  uint32_t tick_ms;
+  float target[2], angle[2], raw_angle[2], speed[2], current[2];
+};
+struct StepTrace {
+  uint32_t request;  // 0 不请求，1 立即采样，2 等待目标角跳变后采样
+  uint32_t status;   // 0 空闲，1 等待阶跃，2 采集中，3 完成，4 模式退出中止
+  uint32_t count, stride; // stride=1 为 1 kHz；改成 4 可记录约 1 s
+  uint32_t monitor_status, monitor_ms, start_ms, elapsed_ms, max_gap_ms, last_outside_ms[2];
+  float band_deg; // 连续稳定判据，默认任务二 2%：10° × 2% = 0.2°
+  float max_error_after_100ms[2], peak_current[2];
+  StepTraceSample samples[256];
+};
+extern StepTrace step_trace;
+
+struct StepFeedforward {
+  float positive_a[2], negative_a[2], applied_a[2]; // 单向阶跃保持前馈，A；默认 0
+};
+extern StepFeedforward step_feedforward;
+
 #endif  // MOTOR_MONITOR_H
